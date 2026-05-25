@@ -1,0 +1,22 @@
+# Secrets — never commit these
+*.json
+.env
+.env.local
+.env.*.local
+*_secret_*
+*client_secret*
+credentials.json
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.env.local
+
+# Backend
+backend/target/
+backend/.mvn/
+*.class
+
+# OS
+.DS_Store
+Thumbs.db
