@@ -1,3 +1,6 @@
+Exit code: 0
+Wall time: 0.2 seconds
+Output:
 #!/usr/bin/env python3
 """
 College ranking ingestion for CollegeTracker.
@@ -10,6 +13,7 @@ CSV import path. The output JSON is consumed by both:
   - backend/src/main/resources/rankings.json
 
 Examples:
+  python scrape_rankings.py --major computer-science --sync
   python scrape_rankings.py --major national-universities --limit 100 --sync
   python scrape_rankings.py --major national-universities --csv input/rankings.csv --sync
 """
@@ -21,9 +25,10 @@ import re
 import shutil
 import sys
 import time
+from html import unescape
 from html.parser import HTMLParser
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import requests
 
@@ -111,6 +116,8 @@ BROWSER_UA = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/124.0.0.0 Safari/537.36"
 )
+API_PAGE_SIZE = 100
+MAX_SCRAPE_PAGES = 50
 
 
 class CollegeProfileLinkParser(HTMLParser):
@@ -126,7 +133,7 @@ class CollegeProfileLinkParser(HTMLParser):
         if tag != "a":
             return
         href = dict(attrs).get("href", "")
-        if re.match(r"^/best-colleges/[^?#]+-\d+$", href):
+        if re.match(r"^/best-(?:colleges|graduate-schools)/[^?#]+-\d+$", href):
             self._active_href = href
             self._text = []
 
@@ -158,7 +165,17 @@ def normalize_rank(value):
         return None
 
 
-def dedupe_rankings(rankings, limit):
+def limit_reached(items, limit):
+    return limit is not None and len(items) >= limit
+
+
+def remaining_limit(limit, count):
+    if limit is None:
+        return None
+    return max(0, limit - count)
+
+
+def dedupe_rankings(rankings, limit=None):
     seen = set()
     unique = []
     for entry in sorted(rankings, key=lambda item: item.get("rank", 999999)):
@@ -175,7 +192,7 @@ def dedupe_rankings(rankings, limit):
             "name": name,
             "unitId": entry.get("unitId"),
         })
-        if len(unique) >= limit:
+        if limit_reached(unique, limit):
             break
     return unique
 
@@ -190,7 +207,70 @@ def ranking_payload(slug, info, rankings, source_url=None):
     }
 
 
-def extract_profile_links_from_html(html, start_rank=1, limit=100):
+def parse_json_ld_list_item(item, fallback_rank):
+    if not isinstance(item, dict):
+        return None
+    nested_item = item.get("item") if isinstance(item.get("item"), dict) else {}
+    rank = fallback_rank
+    name = (
+        item.get("name")
+        or nested_item.get("name")
+        or nested_item.get("alternateName")
+    )
+    if not rank or not name:
+        return None
+    item_id = nested_item.get("@id") or nested_item.get("url") or ""
+    if not re.search(r"/best-(?:colleges|graduate-schools)/[^?#]+-\d+(?:[/#?]|$)", item_id):
+        return None
+    unit_match = re.search(r"-(\d+)(?:[/#?]|$)", item_id)
+    return {
+        "rank": rank,
+        "name": str(name).strip(),
+        "unitId": unit_match.group(1) if unit_match else None,
+    }
+
+
+def iter_json_ld_item_lists(obj, depth=0):
+    if depth > 8:
+        return
+    if isinstance(obj, dict):
+        items = obj.get("itemListElement")
+        item_type = obj.get("@type")
+        is_item_list = item_type == "ItemList" or (
+            isinstance(item_type, list) and "ItemList" in item_type
+        )
+        if is_item_list and isinstance(items, list):
+            visible_count = normalize_rank(obj.get("numberOfItems"))
+            yield items[:visible_count] if visible_count else items
+        for value in obj.values():
+            yield from iter_json_ld_item_lists(value, depth + 1)
+    elif isinstance(obj, list):
+        for item in obj:
+            yield from iter_json_ld_item_lists(item, depth + 1)
+
+
+def extract_json_ld_rankings_from_html(html, start_rank=1, limit=None):
+    rankings = []
+    script_pattern = re.compile(
+        r"<script[^>]+type=[\"']application/ld\+json[\"'][^>]*>(.*?)</script>",
+        re.IGNORECASE | re.DOTALL,
+    )
+    for match in script_pattern.finditer(html):
+        try:
+            data = json.loads(unescape(match.group(1)).strip())
+        except ValueError:
+            continue
+        for items in iter_json_ld_item_lists(data):
+            for item in items:
+                entry = parse_json_ld_list_item(item, start_rank + len(rankings))
+                if entry:
+                    rankings.append(entry)
+                    if limit_reached(rankings, limit):
+                        return rankings
+    return rankings
+
+
+def extract_profile_links_from_html(html, start_rank=1, limit=None):
     parser = CollegeProfileLinkParser()
     parser.feed(html)
     seen = set()
@@ -205,13 +285,21 @@ def extract_profile_links_from_html(html, start_rank=1, limit=100):
             "name": name,
             "unitId": unit_match.group(1) if unit_match else None,
         })
-        if len(rankings) >= limit:
+        if limit_reached(rankings, limit):
             break
     return rankings
 
 
-def parse_json_rankings(obj, out, limit, depth=0):
-    if depth > 8 or len(out) >= limit:
+def extract_rankings_from_html(html, start_rank=1, limit=None):
+    rankings = extract_json_ld_rankings_from_html(html, start_rank, limit)
+    if rankings:
+        return dedupe_rankings(rankings, limit)
+    rankings = extract_profile_links_from_html(html, start_rank=start_rank, limit=limit)
+    return dedupe_rankings(rankings, limit)
+
+
+def parse_json_rankings(obj, out, limit=None, depth=0):
+    if depth > 8 or limit_reached(out, limit):
         return
     if isinstance(obj, list) and len(obj) >= 3 and isinstance(obj[0], dict):
         keys = {key.lower() for key in obj[0].keys()}
@@ -222,7 +310,7 @@ def parse_json_rankings(obj, out, limit, depth=0):
                 entry = parse_ranking_item(item)
                 if entry:
                     out.append(entry)
-                    if len(out) >= limit:
+                    if limit_reached(out, limit):
                         return
             return
     if isinstance(obj, dict):
@@ -260,7 +348,7 @@ def parse_ranking_item(item):
     return {"rank": rank, "name": str(name).strip(), "unitId": unit_id}
 
 
-def try_direct_api(page_url, limit):
+def try_direct_api(page_url, limit=None, max_pages=MAX_SCRAPE_PAGES):
     ranking_slug = page_url.rstrip("/").split("/")[-1]
     session = requests.Session()
     session.headers.update({
@@ -282,13 +370,13 @@ def try_direct_api(page_url, limit):
     ]
     all_results = []
     for params in candidates:
-        for page_num in range(1, 12):
+        for page_num in range(1, max_pages + 1):
             query = {
                 **params,
                 "_sort": "rank",
                 "_sortDirection": "asc",
                 "_page": page_num,
-                "_schools_per_page": min(limit, 100),
+                "_schools_per_page": min(limit, API_PAGE_SIZE) if limit else API_PAGE_SIZE,
             }
             try:
                 response = session.get(endpoint, params=query, timeout=20)
@@ -300,24 +388,23 @@ def try_direct_api(page_url, limit):
             before = len(all_results)
             parse_json_rankings(data, all_results, limit)
             all_results = dedupe_rankings(all_results, limit)
-            if len(all_results) >= limit or len(all_results) == before:
+            if limit_reached(all_results, limit) or len(all_results) == before:
                 break
         if all_results:
             break
     return dedupe_rankings(all_results, limit)
 
 
-def build_page_url(base_url, page_index):
-    if page_index <= 0:
+def build_page_url(base_url, page_number):
+    if page_number <= 1:
         return base_url
     parsed = urlparse(base_url)
-    if parsed.netloc.endswith("usnews.com") and "?" not in base_url:
-        return f"{base_url}&_page={page_index}"
-    separator = "&" if "?" in base_url else "?"
-    return f"{base_url}{separator}_page={page_index}"
+    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    query["_page"] = str(page_number)
+    return urlunparse(parsed._replace(query=urlencode(query)))
 
 
-def try_browser_html(source_url, limit, debug_path=None):
+def try_browser_html(source_url, limit=None, debug_path=None, max_pages=MAX_SCRAPE_PAGES):
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
@@ -341,37 +428,37 @@ def try_browser_html(source_url, limit, debug_path=None):
             },
         )
         page = context.new_page()
-        page_index = 0
-        while len(rankings) < limit:
-            current_url = build_page_url(source_url, page_index)
+        page_number = 1
+        while not limit_reached(rankings, limit) and page_number <= max_pages:
+            current_url = build_page_url(source_url, page_number)
             try:
                 page.goto(current_url, wait_until="domcontentloaded", timeout=45000)
                 page.wait_for_timeout(2000)
             except Exception as exc:
-                print(f"    Pagination stopped at page {page_index}: {type(exc).__name__}")
+                print(f"    Pagination stopped at page {page_number}: {type(exc).__name__}")
                 break
             html = page.content()
-            if debug_path and page_index == 0:
+            if debug_path and page_number == 1:
                 debug_path.parent.mkdir(parents=True, exist_ok=True)
                 debug_path.write_text(html, encoding="utf-8")
             before = len(rankings)
             rankings.extend(
-                extract_profile_links_from_html(
+                extract_rankings_from_html(
                     html,
                     start_rank=before + 1,
-                    limit=limit - before,
+                    limit=remaining_limit(limit, before),
                 )
             )
             rankings = dedupe_rankings(rankings, limit)
             if len(rankings) <= before:
                 break
-            page_index += 1
+            page_number += 1
         context.close()
         browser.close()
     return rankings
 
 
-def import_csv(csv_path, slug, info, limit, source_url=None):
+def import_csv(csv_path, slug, info, limit=None, source_url=None):
     rows = []
     with Path(csv_path).open(newline="", encoding="utf-8-sig") as handle:
         reader = csv.DictReader(handle)
@@ -420,7 +507,7 @@ def resolve_targets(major):
 def main():
     parser = argparse.ArgumentParser(description="Collect college ranking data")
     parser.add_argument("--major", help="Major/ranking slug or alias, e.g. nat or national-universities")
-    parser.add_argument("--limit", type=int, default=100, help="Max schools per ranking list")
+    parser.add_argument("--limit", type=int, default=None, help="Optional max schools per ranking list")
     parser.add_argument("--csv", help="Import rankings from CSV instead of scraping. Required columns: rank,name")
     parser.add_argument("--source-url", help="Source URL to store when importing CSV")
     parser.add_argument("--sync", action="store_true", help="Copy output to frontend and backend data locations")
@@ -429,7 +516,7 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="Print target URLs and exit")
     args = parser.parse_args()
 
-    limit = max(1, min(args.limit, 250))
+    limit = max(1, args.limit) if args.limit else None
     targets = resolve_targets(args.major)
     out_path = Path(args.out) if args.out else Path(__file__).parent / "output" / "rankings.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)
