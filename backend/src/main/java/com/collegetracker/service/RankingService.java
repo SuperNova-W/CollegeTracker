@@ -29,7 +29,7 @@ public class RankingService {
     public void loadRankingsFromJson() {
         ClassPathResource resource = new ClassPathResource("rankings.json");
         if (!resource.exists()) {
-            log.info("rankings.json not found in classpath â€” skipping ranking load. " +
+            log.info("rankings.json not found in classpath — skipping ranking load. " +
                      "Run the scraper with --sync to copy data into backend resources.");
             return;
         }
@@ -71,7 +71,7 @@ public class RankingService {
                 log.info("Loaded {} rankings for '{}'", entities.size(), name);
             }
 
-            log.info("Ranking load complete â€” {} total entries across {} majors.", loaded, majors.size());
+            log.info("Ranking load complete — {} total entries across {} majors.", loaded, majors.size());
         } catch (Exception e) {
             log.error("Failed to load rankings.json: {}", e.getMessage(), e);
         }
