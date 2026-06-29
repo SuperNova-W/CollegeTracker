@@ -29,9 +29,12 @@ import argparse
 import re
 import sys
 import requests
+import csv
+import shutil
+from html.parser import HTMLParser
 from pathlib import Path
 
-# ── Major catalogue ────────────────────────────────────────────────────────────
+# â”€â”€ Major catalogue â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 MAJORS = {
     "computer-science": {
@@ -117,9 +120,86 @@ _BROWSER_UA = (
     "Chrome/124.0.0.0 Safari/537.36"
 )
 
-# ── Strategy 0: Direct API (no browser) ───────────────────────────────────────
+# â”€â”€ Strategy 0: Direct API (no browser) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-def _try_direct_api(page_url):
+def _dedupe_rankings(rankings, limit):
+    """Return unique ranking rows ordered by rank, capped to limit."""
+    seen = set()
+    unique = []
+    for entry in sorted(rankings, key=lambda x: x.get("rank", 9999)):
+        rank = entry.get("rank")
+        name = entry.get("name")
+        if not rank or not name:
+            continue
+        key = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(entry)
+        if len(unique) >= limit:
+            break
+    return unique
+
+
+def _write_outputs(output, out_path, sync_targets=False):
+    out_path.write_text(json.dumps(output, indent=2, ensure_ascii=False), encoding="utf-8")
+    if not sync_targets:
+        return
+
+    repo_root = Path(__file__).resolve().parents[1]
+    targets = [
+        repo_root / "frontend" / "src" / "data" / "rankings.json",
+        repo_root / "backend" / "src" / "main" / "resources" / "rankings.json",
+    ]
+    for target in targets:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(out_path, target)
+        print(f"    synced -> {target.relative_to(repo_root)}")
+
+
+def load_rankings_csv(csv_path, major_slug, major_name, source_url=None, limit=100):
+    """
+    Import rankings from a CSV export.
+
+    Expected columns:
+      rank,name
+
+    Optional columns:
+      unitId,sourceUrl
+    """
+    rankings = []
+    with Path(csv_path).open(newline="", encoding="utf-8-sig") as handle:
+        reader = csv.DictReader(handle)
+        required = {"rank", "name"}
+        missing = required - set(reader.fieldnames or [])
+        if missing:
+            raise ValueError(f"CSV missing required columns: {', '.join(sorted(missing))}")
+
+        for row in reader:
+            try:
+                rank = int(str(row.get("rank", "")).replace("#", "").replace("T-", "").strip())
+            except ValueError:
+                continue
+            name = (row.get("name") or "").strip()
+            if not name:
+                continue
+            rankings.append({
+                "rank": rank,
+                "name": name,
+                "unitId": (row.get("unitId") or "").strip() or None,
+            })
+
+    rankings = _dedupe_rankings(rankings, limit)
+    return {
+        "slug": major_slug,
+        "name": major_name,
+        "sourceUrl": source_url,
+        "scrapedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "rankings": rankings,
+    }
+
+
+def _try_direct_api(page_url, limit=100):
     """
     US News serves ranking data from an internal search API used by their SPA.
     Try both known endpoint patterns before falling back to Playwright.
@@ -152,7 +232,7 @@ def _try_direct_api(page_url):
             "_sort": "rank",
             "_sortDirection": "asc",
             "_page": 1,
-            "_schools_per_page": 50,
+            "_schools_per_page": min(limit, 100),
         }),
         # Alternate endpoint pattern
         ("https://www.usnews.com/best-colleges/api/search", {
@@ -161,27 +241,38 @@ def _try_direct_api(page_url):
             "_sort": "rank",
             "_sortDirection": "asc",
             "_page": 1,
-            "_schools_per_page": 50,
+            "_schools_per_page": min(limit, 100),
         }),
     ]
 
     for api_url, params in candidates:
+        all_results = []
         try:
-            r = session.get(api_url, params=params, timeout=15)
-            if r.status_code != 200:
-                continue
-            data = r.json()
-            results = []
-            _walk_for_rankings(data, results, depth=0)
-            if len(results) >= 3:
-                return results
+            for page_num in range(1, 8):
+                page_params = dict(params)
+                page_params["_page"] = page_num
+                r = session.get(api_url, params=page_params, timeout=20)
+                if r.status_code != 200:
+                    break
+                data = r.json()
+                results = []
+                _walk_for_rankings(data, results, depth=0, limit=limit)
+                if not results:
+                    break
+                before = len(all_results)
+                all_results.extend(results)
+                all_results = _dedupe_rankings(all_results, limit)
+                if len(all_results) >= limit or len(all_results) == before:
+                    break
+            if len(all_results) >= 3:
+                return all_results
         except Exception:
             pass
 
     return None
 
 
-# ── Extraction helpers ─────────────────────────────────────────────────────────
+# â”€â”€ Extraction helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def extract_from_jsonld(page):
     """
@@ -251,7 +342,7 @@ def extract_from_next_data(page):
     return results if results else None
 
 
-def _walk_for_rankings(obj, out, depth):
+def _walk_for_rankings(obj, out, depth, limit=100):
     """Recursive walk: find arrays that look like ranking lists."""
     if depth > 8:
         return
@@ -262,17 +353,17 @@ def _walk_for_rankings(obj, out, depth):
             if ("name" in keys or "school" in keys or "displayname" in keys) and (
                 "rank" in keys or "ranking" in keys or "sortrank" in keys
             ):
-                for item in obj[:50]:
+                for item in obj[:limit]:
                     entry = _parse_ranking_item(item)
                     if entry:
                         out.append(entry)
                 return
     if isinstance(obj, dict):
         for v in obj.values():
-            _walk_for_rankings(v, out, depth + 1)
+            _walk_for_rankings(v, out, depth + 1, limit)
     elif isinstance(obj, list):
         for item in obj:
-            _walk_for_rankings(item, out, depth + 1)
+            _walk_for_rankings(item, out, depth + 1, limit)
 
 
 def _parse_ranking_item(item):
@@ -364,17 +455,68 @@ def extract_from_dom(page):
         return None
 
 
-# ── Main scraper ───────────────────────────────────────────────────────────────
+class _CollegeProfileLinkParser(HTMLParser):
+    """Extract US News college profile links from server-rendered ranking HTML."""
 
-_STEALTH_SCRIPT = """
-    Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-    Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
-    Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
-    window.chrome = {runtime: {}, loadTimes: function(){}, csi: function(){}, app: {}};
-    Object.defineProperty(navigator, 'permissions', {
-        get: () => ({query: () => Promise.resolve({state: 'granted'})})
-    });
-"""
+    def __init__(self):
+        super().__init__()
+        self.links = []
+        self._active_href = None
+        self._text = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag != "a":
+            return
+        href = dict(attrs).get("href", "")
+        if re.match(r"^/best-colleges/[^?#]+-\d+$", href):
+            self._active_href = href
+            self._text = []
+
+    def handle_data(self, data):
+        if self._active_href:
+            self._text.append(data)
+
+    def handle_endtag(self, tag):
+        if tag != "a" or not self._active_href:
+            return
+        name = " ".join("".join(self._text).split())
+        if name:
+            self.links.append((self._active_href, name))
+        self._active_href = None
+        self._text = []
+
+
+def extract_profile_links_from_html(html, start_rank=1, limit=100):
+    """Fallback for current US News ranking pages: profile links appear in rank order."""
+    parser = _CollegeProfileLinkParser()
+    parser.feed(html)
+    seen = set()
+    rankings = []
+    for href, name in parser.links:
+        if href in seen:
+            continue
+        seen.add(href)
+        unit_match = re.search(r"-(\d+)$", href)
+        rankings.append({
+            "rank": start_rank + len(rankings),
+            "name": name,
+            "unitId": unit_match.group(1) if unit_match else None,
+        })
+        if len(rankings) >= limit:
+            break
+    return rankings
+
+
+def _page_url(base_url, page_index):
+    if page_index <= 0:
+        return base_url
+    if "usnews.com" in base_url and "?" not in base_url:
+        return f"{base_url}&_page={page_index}"
+    separator = "&" if "?" in base_url else "?"
+    return f"{base_url}{separator}_page={page_index}"
+
+
+# â”€â”€ Main scraper â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 _EXTRA_HEADERS = {
     "Accept": (
@@ -395,21 +537,21 @@ _EXTRA_HEADERS = {
 }
 
 
-def scrape_major(browser, major_slug, major_info, debug=False, debug_dir=None, stealth_fn=None):
-    print(f"\n▶  {major_info['name']}  ({major_info['url']})")
+def scrape_major(browser, major_slug, major_info, debug=False, debug_dir=None, limit=100):
+    print(f"\nâ–¶  {major_info['name']}  ({major_info['url']})")
 
     # --- Strategy 0: direct API (no browser) ---
-    print("    Trying direct API…")
-    direct = _try_direct_api(major_info["url"])
+    print("    Trying direct APIâ€¦")
+    direct = _try_direct_api(major_info["url"], limit=limit)
     if direct and len(direct) >= 3:
-        print(f"    ✓  Direct API: {len(direct)} entries")
-        direct.sort(key=lambda x: x.get("rank", 999))
+        print(f"    âœ“  Direct API: {len(direct)} entries")
+        direct = _dedupe_rankings(direct, limit)
         return {
             "slug": major_slug,
             "name": major_info["name"],
             "sourceUrl": major_info["url"],
             "scrapedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "rankings": direct[:50],
+            "rankings": direct,
         }
 
     # --- Playwright strategies ---
@@ -421,10 +563,6 @@ def scrape_major(browser, major_slug, major_info, debug=False, debug_dir=None, s
         extra_http_headers=_EXTRA_HEADERS,
     )
     page = context.new_page()
-    if stealth_fn:
-        stealth_fn(page)
-    else:
-        page.add_init_script(_STEALTH_SCRIPT)
 
     captured_responses = []
 
@@ -447,46 +585,67 @@ def scrape_major(browser, major_slug, major_info, debug=False, debug_dir=None, s
 
     rankings = []
     try:
-        print("    Loading page…")
+        print("    Loading pageâ€¦")
         try:
             page.goto(major_info["url"], wait_until="domcontentloaded", timeout=30000)
         except Exception as e1:
-            print(f"    domcontentloaded failed ({type(e1).__name__}), continuing anyway…")
+            print(f"    domcontentloaded failed ({type(e1).__name__}), continuing anywayâ€¦")
 
         page.wait_for_timeout(3000)
 
-        print("    Trying JSON-LD…")
+        print("    Trying JSON-LDâ€¦")
         rankings = extract_from_jsonld(page) or []
 
-        print("    Trying __NEXT_DATA__…")
+        print("    Trying __NEXT_DATA__â€¦")
         if len(rankings) < 3:
             rankings = extract_from_next_data(page) or []
 
         if len(rankings) < 3:
-            print("    Trying intercepted API responses…")
+            print("    Trying intercepted API responsesâ€¦")
             rankings = extract_from_api_intercept(captured_responses) or []
 
         if len(rankings) < 3:
-            print("    Trying DOM extraction…")
+            print("    Trying DOM extractionâ€¦")
             rankings = extract_from_dom(page) or []
+
+        if len(rankings) < 3:
+            print("    Trying profile-link extractionâ€¦")
+            rankings = extract_profile_links_from_html(page.content(), start_rank=1, limit=limit)
+
+        while 0 < len(rankings) < limit:
+            next_page = len(rankings) // 10
+            if next_page <= 0:
+                next_page = 1
+            next_url = _page_url(major_info["url"], next_page)
+            before = len(rankings)
+            try:
+                page.goto(next_url, wait_until="domcontentloaded", timeout=30000)
+                page.wait_for_timeout(1500)
+                more = extract_profile_links_from_html(page.content(), start_rank=before + 1, limit=limit - before)
+                rankings.extend(more)
+                rankings = _dedupe_rankings(rankings, limit)
+            except Exception as e:
+                print(f"    Pagination stopped at page {next_page}: {type(e).__name__}")
+                break
+            if len(rankings) <= before:
+                break
 
         if debug and debug_dir:
             html_path = Path(debug_dir) / f"{major_slug}.html"
             html_path.write_text(page.content(), encoding="utf-8")
-            print(f"    Debug HTML → {html_path}")
+            print(f"    Debug HTML â†’ {html_path}")
 
     except Exception as e:
         print(f"    ERROR: {e}")
     finally:
         context.close()
 
-    rankings.sort(key=lambda x: x.get("rank", 999))
-    rankings = rankings[:50]
+    rankings = _dedupe_rankings(rankings, limit)
 
     if rankings:
-        print(f"    ✓  Found {len(rankings)} schools  (top: {rankings[0]['name']})")
+        print(f"    âœ“  Found {len(rankings)} schools  (top: {rankings[0]['name']})")
     else:
-        print("    ✗  No rankings extracted — run with --debug to inspect the HTML")
+        print("    âœ—  No rankings extracted â€” run with --debug to inspect the HTML")
 
     return {
         "slug": major_slug,
@@ -497,14 +656,39 @@ def scrape_major(browser, major_slug, major_info, debug=False, debug_dir=None, s
     }
 
 
+def scrape_major_direct_only(major_slug, major_info, limit=100):
+    """Try only the requests-based endpoint path; useful when Playwright is not installed."""
+    print(f"\n>  {major_info['name']}  ({major_info['url']})")
+    print("    Trying direct API...")
+    direct = _try_direct_api(major_info["url"], limit=limit) or []
+    direct = _dedupe_rankings(direct, limit)
+    if direct:
+        print(f"    OK  Direct API: {len(direct)} entries")
+    else:
+        print("    No ranking entries from direct API")
+    return {
+        "slug": major_slug,
+        "name": major_info["name"],
+        "sourceUrl": major_info["url"],
+        "scrapedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "rankings": direct,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description="Scrape US News college rankings")
     parser.add_argument("--major", help="Major slug or alias (e.g. cs, ee, business)")
+    parser.add_argument("--limit", type=int, default=100, help="Max schools per ranking list")
+    parser.add_argument("--csv", help="Import rankings from CSV instead of scraping. Required columns: rank,name")
+    parser.add_argument("--sync", action="store_true", help="Copy output to frontend/src/data and backend resources")
+    parser.add_argument("--source-url", help="Source URL to store when importing CSV")
     parser.add_argument("--debug", action="store_true", help="Save HTML files for selector debugging")
     parser.add_argument("--out", default=None, help="Output JSON path (default: output/rankings.json)")
     parser.add_argument("--dry-run", action="store_true", help="Print URLs without launching browser")
     parser.add_argument("--headed", action="store_true", help="Run Chromium in headed (visible) mode")
     args = parser.parse_args()
+
+    limit = max(1, min(args.limit, 250))
 
     if args.major:
         slug = ALIASES.get(args.major, args.major)
@@ -516,7 +700,7 @@ def main():
         targets = MAJORS
 
     if args.dry_run:
-        print("Dry run — URLs to scrape:")
+        print("Dry run â€” URLs to scrape:")
         for slug, info in targets.items():
             print(f"  {slug}: {info['url']}")
         return
@@ -530,49 +714,70 @@ def main():
     existing = {}
     if out_path.exists():
         try:
-            for entry in json.loads(out_path.read_text()):
+            for entry in json.loads(out_path.read_text(encoding="utf-8")):
                 existing[entry["slug"]] = entry
         except Exception:
             pass
 
-    from playwright.sync_api import sync_playwright
+    if args.csv:
+        if len(targets) != 1:
+            print("CSV import needs --major so the imported list has a slug/name.")
+            sys.exit(1)
+        slug, info = next(iter(targets.items()))
+        imported = load_rankings_csv(
+            args.csv,
+            major_slug=slug,
+            major_name=info["name"],
+            source_url=args.source_url or info["url"],
+            limit=limit,
+        )
+        existing[slug] = imported
+        output = list(existing.values())
+        _write_outputs(output, out_path, sync_targets=args.sync)
+        print(f"\nSaved CSV import: {len(imported['rankings'])} entries -> {out_path}")
+        return
+
     try:
-        from playwright_stealth import stealth_sync as _stealth_sync
-        _has_stealth = True
+        from playwright.sync_api import sync_playwright
     except ImportError:
-        _has_stealth = False
+        print("Playwright is not installed. Trying direct API only.")
+        print("Install browser fallback with: pip install -r requirements.txt && playwright install chromium")
+        for slug, info in targets.items():
+            result = scrape_major_direct_only(slug, info, limit=limit)
+            if result["rankings"]:
+                existing[slug] = result
+
+        output = list(existing.values())
+        _write_outputs(output, out_path, sync_targets=args.sync)
+        total = sum(len(m["rankings"]) for m in output)
+        print(f"\nSaved {len(output)} majors, {total} total entries -> {out_path}")
+        return
 
     with sync_playwright() as pw:
         browser = pw.chromium.launch(
             headless=not args.headed,
             args=[
-                "--disable-blink-features=AutomationControlled",
                 "--disable-http2",
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
-                "--disable-extensions",
-                "--disable-default-apps",
-                "--no-first-run",
             ],
         )
-        stealth_fn = _stealth_sync if _has_stealth else None
-        if _has_stealth:
-            print("    playwright-stealth enabled")
         for slug, info in targets.items():
-            result = scrape_major(browser, slug, info, debug=args.debug, debug_dir=debug_dir, stealth_fn=stealth_fn)
+            result = scrape_major(browser, slug, info, debug=args.debug, debug_dir=debug_dir, limit=limit)
             if result["rankings"]:
                 existing[slug] = result
             time.sleep(2)
         browser.close()
 
     output = list(existing.values())
-    out_path.write_text(json.dumps(output, indent=2, ensure_ascii=False))
+    _write_outputs(output, out_path, sync_targets=args.sync)
     total = sum(len(m["rankings"]) for m in output)
-    print(f"\n✅  Saved {len(output)} majors, {total} total entries → {out_path}")
-    print(f"\nNext step:")
-    print(f"  cp {out_path} ../frontend/src/data/rankings.json")
-    print(f"  cp {out_path} ../backend/src/main/resources/rankings.json")
+    print(f"\nâœ…  Saved {len(output)} majors, {total} total entries â†’ {out_path}")
+    if not args.sync:
+        print(f"\nNext step:")
+        print(f"  python scrape_rankings.py --sync")
 
 
 if __name__ == "__main__":
     main()
+
