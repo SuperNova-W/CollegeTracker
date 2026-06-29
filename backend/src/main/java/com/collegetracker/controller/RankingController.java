@@ -16,7 +16,7 @@ public class RankingController {
 
     private final RankingService rankingService;
 
-    /** GET /api/rankings/majors â€” list of available major slugs + display names */
+    /** GET /api/rankings/majors — list of available major slugs + display names */
     @GetMapping("/majors")
     public List<Map<String, String>> availableMajors() {
         return rankingService.getAvailableMajors();
