@@ -1,6 +1,3 @@
-Exit code: 0
-Wall time: 0.2 seconds
-Output:
 # College ranking data
 
 This app can read ranking data from `rankings.json` in two places:
