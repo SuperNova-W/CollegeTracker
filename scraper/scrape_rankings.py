@@ -1,40 +1,32 @@
 #!/usr/bin/env python3
 """
-US News College Rankings Scraper
-=================================
-Scrapes undergraduate program rankings from US News & World Report.
+College ranking ingestion for CollegeTracker.
 
-Strategy (in order):
-  1. Direct requests to US News internal JSON API (no browser)
-  2. Intercept XHR/fetch network responses via Playwright
-  3. Extract from window.__NEXT_DATA__ (Next.js initial state)
-  4. DOM parsing fallback using discovered selectors
-  5. --debug flag saves full page HTML so you can inspect selectors yourself
+This script tries to collect ranking rows from US News using ordinary public
+page/API loading. If the live site blocks, times out, or changes shape, use the
+CSV import path. The output JSON is consumed by both:
 
-Setup:
-    pip install -r requirements.txt
-    playwright install chromium
+  - frontend/src/data/rankings.json
+  - backend/src/main/resources/rankings.json
 
-Usage:
-    python scrape_rankings.py                      # all majors
-    python scrape_rankings.py --major cs           # one major only
-    python scrape_rankings.py --debug              # save HTML for inspection
-    python scrape_rankings.py --out custom.json    # custom output path
-    python scrape_rankings.py --dry-run            # print URLs only, no browser
+Examples:
+  python scrape_rankings.py --major national-universities --limit 100 --sync
+  python scrape_rankings.py --major national-universities --csv input/rankings.csv --sync
 """
 
-import json
-import time
 import argparse
-import re
-import sys
-import requests
 import csv
+import json
+import re
 import shutil
+import sys
+import time
 from html.parser import HTMLParser
 from pathlib import Path
+from urllib.parse import urlparse
 
-# â”€â”€ Major catalogue â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+import requests
+
 
 MAJORS = {
     "computer-science": {
@@ -114,348 +106,14 @@ ALIASES = {
     "nat": "national-universities",
 }
 
-_BROWSER_UA = (
+BROWSER_UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/124.0.0.0 Safari/537.36"
 )
 
-# â”€â”€ Strategy 0: Direct API (no browser) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-def _dedupe_rankings(rankings, limit):
-    """Return unique ranking rows ordered by rank, capped to limit."""
-    seen = set()
-    unique = []
-    for entry in sorted(rankings, key=lambda x: x.get("rank", 9999)):
-        rank = entry.get("rank")
-        name = entry.get("name")
-        if not rank or not name:
-            continue
-        key = name.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        unique.append(entry)
-        if len(unique) >= limit:
-            break
-    return unique
-
-
-def _write_outputs(output, out_path, sync_targets=False):
-    out_path.write_text(json.dumps(output, indent=2, ensure_ascii=False), encoding="utf-8")
-    if not sync_targets:
-        return
-
-    repo_root = Path(__file__).resolve().parents[1]
-    targets = [
-        repo_root / "frontend" / "src" / "data" / "rankings.json",
-        repo_root / "backend" / "src" / "main" / "resources" / "rankings.json",
-    ]
-    for target in targets:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(out_path, target)
-        print(f"    synced -> {target.relative_to(repo_root)}")
-
-
-def load_rankings_csv(csv_path, major_slug, major_name, source_url=None, limit=100):
-    """
-    Import rankings from a CSV export.
-
-    Expected columns:
-      rank,name
-
-    Optional columns:
-      unitId,sourceUrl
-    """
-    rankings = []
-    with Path(csv_path).open(newline="", encoding="utf-8-sig") as handle:
-        reader = csv.DictReader(handle)
-        required = {"rank", "name"}
-        missing = required - set(reader.fieldnames or [])
-        if missing:
-            raise ValueError(f"CSV missing required columns: {', '.join(sorted(missing))}")
-
-        for row in reader:
-            try:
-                rank = int(str(row.get("rank", "")).replace("#", "").replace("T-", "").strip())
-            except ValueError:
-                continue
-            name = (row.get("name") or "").strip()
-            if not name:
-                continue
-            rankings.append({
-                "rank": rank,
-                "name": name,
-                "unitId": (row.get("unitId") or "").strip() or None,
-            })
-
-    rankings = _dedupe_rankings(rankings, limit)
-    return {
-        "slug": major_slug,
-        "name": major_name,
-        "sourceUrl": source_url,
-        "scrapedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "rankings": rankings,
-    }
-
-
-def _try_direct_api(page_url, limit=100):
-    """
-    US News serves ranking data from an internal search API used by their SPA.
-    Try both known endpoint patterns before falling back to Playwright.
-    """
-    ranking_slug = page_url.rstrip("/").split("/")[-1]
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": _BROWSER_UA,
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": page_url,
-        "Origin": "https://www.usnews.com",
-        "DNT": "1",
-        "Sec-Fetch-Dest": "empty",
-        "Sec-Fetch-Mode": "cors",
-        "Sec-Fetch-Site": "same-origin",
-    })
-
-    # First: visit the page with requests to pick up cookies / tokens
-    try:
-        session.get(page_url, timeout=10)
-    except Exception:
-        pass
-
-    candidates = [
-        # Internal search API (used by the Next.js frontend)
-        ("https://www.usnews.com/best-colleges/api/search", {
-            "format": "json",
-            "ranking": ranking_slug,
-            "_sort": "rank",
-            "_sortDirection": "asc",
-            "_page": 1,
-            "_schools_per_page": min(limit, 100),
-        }),
-        # Alternate endpoint pattern
-        ("https://www.usnews.com/best-colleges/api/search", {
-            "format": "json",
-            "specialty": ranking_slug,
-            "_sort": "rank",
-            "_sortDirection": "asc",
-            "_page": 1,
-            "_schools_per_page": min(limit, 100),
-        }),
-    ]
-
-    for api_url, params in candidates:
-        all_results = []
-        try:
-            for page_num in range(1, 8):
-                page_params = dict(params)
-                page_params["_page"] = page_num
-                r = session.get(api_url, params=page_params, timeout=20)
-                if r.status_code != 200:
-                    break
-                data = r.json()
-                results = []
-                _walk_for_rankings(data, results, depth=0, limit=limit)
-                if not results:
-                    break
-                before = len(all_results)
-                all_results.extend(results)
-                all_results = _dedupe_rankings(all_results, limit)
-                if len(all_results) >= limit or len(all_results) == before:
-                    break
-            if len(all_results) >= 3:
-                return all_results
-        except Exception:
-            pass
-
-    return None
-
-
-# â”€â”€ Extraction helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-
-def extract_from_jsonld(page):
-    """
-    Primary strategy: US News embeds a JSON-LD @graph with an ItemList node.
-    Each entry has position (rank) and item.name (school name).
-    This is server-rendered so it's present on first load.
-    """
-    try:
-        blocks = page.evaluate("""() => {
-            return Array.from(
-                document.querySelectorAll('script[type="application/ld+json"]')
-            ).map(s => s.textContent);
-        }""")
-    except Exception as e:
-        print(f"    JSON-LD script query failed: {e}")
-        return None
-
-    for raw in blocks:
-        try:
-            data = json.loads(raw)
-        except Exception:
-            continue
-
-        # Handle both direct object and array
-        nodes = data if isinstance(data, list) else [data]
-
-        # Walk @graph arrays
-        for node in nodes:
-            if isinstance(node, dict):
-                graph = node.get("@graph", [node])
-            else:
-                continue
-            for item in graph:
-                if not isinstance(item, dict):
-                    continue
-                if item.get("@type") != "ItemList":
-                    continue
-                elements = item.get("itemListElement", [])
-                if len(elements) < 3:
-                    continue
-                results = []
-                for el in elements:
-                    rank = el.get("position")
-                    school = el.get("item", {})
-                    name = school.get("name", "")
-                    if rank and name:
-                        results.append({"rank": int(rank), "name": name.strip()})
-                if results:
-                    return results
-
-    return None
-
-
-def extract_from_next_data(page):
-    """Pull ranking entries from window.__NEXT_DATA__ (Next.js initial props)."""
-    try:
-        raw = page.evaluate("JSON.stringify(window.__NEXT_DATA__ || null)")
-        if not raw or raw == "null":
-            return None
-        data = json.loads(raw)
-    except Exception as e:
-        print(f"    __NEXT_DATA__ not available: {e}")
-        return None
-
-    results = []
-    _walk_for_rankings(data, results, depth=0)
-    return results if results else None
-
-
-def _walk_for_rankings(obj, out, depth, limit=100):
-    """Recursive walk: find arrays that look like ranking lists."""
-    if depth > 8:
-        return
-    if isinstance(obj, list) and len(obj) >= 3:
-        sample = obj[0] if obj else {}
-        if isinstance(sample, dict):
-            keys = {k.lower() for k in sample.keys()}
-            if ("name" in keys or "school" in keys or "displayname" in keys) and (
-                "rank" in keys or "ranking" in keys or "sortrank" in keys
-            ):
-                for item in obj[:limit]:
-                    entry = _parse_ranking_item(item)
-                    if entry:
-                        out.append(entry)
-                return
-    if isinstance(obj, dict):
-        for v in obj.values():
-            _walk_for_rankings(v, out, depth + 1, limit)
-    elif isinstance(obj, list):
-        for item in obj:
-            _walk_for_rankings(item, out, depth + 1, limit)
-
-
-def _parse_ranking_item(item):
-    """Normalise a raw ranking dict into {rank, name, unitId}."""
-    if not isinstance(item, dict):
-        return None
-
-    rank = (
-        item.get("rank")
-        or item.get("ranking")
-        or item.get("sortRank")
-        or item.get("display_rank")
-        or (item.get("ranking") or {}).get("sortRank")
-    )
-    try:
-        rank = int(str(rank).replace("T-", "").replace("#", "").strip())
-    except (TypeError, ValueError):
-        return None
-
-    name = (
-        item.get("displayName")
-        or item.get("name")
-        or item.get("school_name")
-        or (item.get("school") or {}).get("name")
-        or (item.get("institution") or {}).get("displayName")
-        or (item.get("institution") or {}).get("name")
-    )
-    if not name:
-        return None
-
-    unit_id = (
-        str(item.get("unitId") or item.get("unit_id") or "").strip() or None
-    )
-
-    return {"rank": rank, "name": str(name).strip(), "unitId": unit_id}
-
-
-def extract_from_api_intercept(captured):
-    """Parse ranking entries from intercepted XHR/fetch JSON responses."""
-    for payload in captured:
-        data = payload.get("data", {})
-        results = []
-        _walk_for_rankings(data, results, depth=0)
-        if len(results) >= 5:
-            return results
-    return None
-
-
-def extract_from_dom(page):
-    """Last-resort DOM extraction."""
-    try:
-        pairs = page.evaluate("""() => {
-            const results = [];
-            const rankEls = document.querySelectorAll(
-                '[class*="rank"],[data-testid*="rank"],[class*="Rank"]'
-            );
-            for (const el of rankEls) {
-                const rankText = el.innerText?.trim();
-                const rankNum = parseInt(rankText);
-                if (!rankNum || rankNum > 200) continue;
-                let parent = el.parentElement;
-                for (let i = 0; i < 5; i++) {
-                    if (!parent) break;
-                    const link = parent.querySelector('a[href*="best-colleges"]');
-                    if (link && link.innerText.trim().length > 3) {
-                        results.push({ rank: rankNum, name: link.innerText.trim() });
-                        break;
-                    }
-                    parent = parent.parentElement;
-                }
-            }
-            if (results.length < 3) {
-                const links = document.querySelectorAll('a[href*="/best-colleges/"][href*="/name/"]');
-                for (const link of links) {
-                    const name = link.innerText.trim();
-                    if (!name) continue;
-                    let node = link.closest('li,article,[class*="result"],[class*="Result"]');
-                    if (!node) continue;
-                    const text = node.innerText;
-                    const m = text.match(/^\\s*(\\d{1,3})[^\\d]/);
-                    if (m) results.push({ rank: parseInt(m[1]), name });
-                }
-            }
-            return results;
-        }""")
-        return [p for p in pairs if p.get("rank") and p.get("name")] or None
-    except Exception as e:
-        print(f"    DOM extraction error: {e}")
-        return None
-
-
-class _CollegeProfileLinkParser(HTMLParser):
+class CollegeProfileLinkParser(HTMLParser):
     """Extract US News college profile links from server-rendered ranking HTML."""
 
     def __init__(self):
@@ -486,9 +144,54 @@ class _CollegeProfileLinkParser(HTMLParser):
         self._text = []
 
 
+def timestamp():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def normalize_rank(value):
+    if value is None:
+        return None
+    text = str(value).replace("#", "").replace("T-", "").strip()
+    try:
+        return int(text)
+    except ValueError:
+        return None
+
+
+def dedupe_rankings(rankings, limit):
+    seen = set()
+    unique = []
+    for entry in sorted(rankings, key=lambda item: item.get("rank", 999999)):
+        name = (entry.get("name") or "").strip()
+        rank = entry.get("rank")
+        if not name or not rank:
+            continue
+        key = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append({
+            "rank": rank,
+            "name": name,
+            "unitId": entry.get("unitId"),
+        })
+        if len(unique) >= limit:
+            break
+    return unique
+
+
+def ranking_payload(slug, info, rankings, source_url=None):
+    return {
+        "slug": slug,
+        "name": info["name"],
+        "sourceUrl": source_url or info["url"],
+        "scrapedAt": timestamp(),
+        "rankings": rankings,
+    }
+
+
 def extract_profile_links_from_html(html, start_rank=1, limit=100):
-    """Fallback for current US News ranking pages: profile links appear in rank order."""
-    parser = _CollegeProfileLinkParser()
+    parser = CollegeProfileLinkParser()
     parser.feed(html)
     seen = set()
     rankings = []
@@ -507,275 +210,271 @@ def extract_profile_links_from_html(html, start_rank=1, limit=100):
     return rankings
 
 
-def _page_url(base_url, page_index):
+def parse_json_rankings(obj, out, limit, depth=0):
+    if depth > 8 or len(out) >= limit:
+        return
+    if isinstance(obj, list) and len(obj) >= 3 and isinstance(obj[0], dict):
+        keys = {key.lower() for key in obj[0].keys()}
+        has_name = bool({"name", "school", "displayname", "school_name"} & keys)
+        has_rank = bool({"rank", "ranking", "sortrank", "display_rank"} & keys)
+        if has_name and has_rank:
+            for item in obj:
+                entry = parse_ranking_item(item)
+                if entry:
+                    out.append(entry)
+                    if len(out) >= limit:
+                        return
+            return
+    if isinstance(obj, dict):
+        for value in obj.values():
+            parse_json_rankings(value, out, limit, depth + 1)
+    elif isinstance(obj, list):
+        for item in obj:
+            parse_json_rankings(item, out, limit, depth + 1)
+
+
+def parse_ranking_item(item):
+    if not isinstance(item, dict):
+        return None
+    nested_ranking = item.get("ranking") if isinstance(item.get("ranking"), dict) else {}
+    nested_school = item.get("school") if isinstance(item.get("school"), dict) else {}
+    nested_institution = item.get("institution") if isinstance(item.get("institution"), dict) else {}
+    rank = normalize_rank(
+        item.get("rank")
+        or item.get("ranking")
+        or item.get("sortRank")
+        or item.get("display_rank")
+        or nested_ranking.get("sortRank")
+    )
+    name = (
+        item.get("displayName")
+        or item.get("name")
+        or item.get("school_name")
+        or nested_school.get("name")
+        or nested_institution.get("displayName")
+        or nested_institution.get("name")
+    )
+    if not rank or not name:
+        return None
+    unit_id = str(item.get("unitId") or item.get("unit_id") or "").strip() or None
+    return {"rank": rank, "name": str(name).strip(), "unitId": unit_id}
+
+
+def try_direct_api(page_url, limit):
+    ranking_slug = page_url.rstrip("/").split("/")[-1]
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": BROWSER_UA,
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": page_url,
+        "Origin": "https://www.usnews.com",
+    })
+    try:
+        session.get(page_url, timeout=15)
+    except requests.RequestException:
+        pass
+
+    endpoint = "https://www.usnews.com/best-colleges/api/search"
+    candidates = [
+        {"format": "json", "ranking": ranking_slug},
+        {"format": "json", "specialty": ranking_slug},
+    ]
+    all_results = []
+    for params in candidates:
+        for page_num in range(1, 12):
+            query = {
+                **params,
+                "_sort": "rank",
+                "_sortDirection": "asc",
+                "_page": page_num,
+                "_schools_per_page": min(limit, 100),
+            }
+            try:
+                response = session.get(endpoint, params=query, timeout=20)
+                if response.status_code != 200:
+                    break
+                data = response.json()
+            except (requests.RequestException, ValueError):
+                break
+            before = len(all_results)
+            parse_json_rankings(data, all_results, limit)
+            all_results = dedupe_rankings(all_results, limit)
+            if len(all_results) >= limit or len(all_results) == before:
+                break
+        if all_results:
+            break
+    return dedupe_rankings(all_results, limit)
+
+
+def build_page_url(base_url, page_index):
     if page_index <= 0:
         return base_url
-    if "usnews.com" in base_url and "?" not in base_url:
+    parsed = urlparse(base_url)
+    if parsed.netloc.endswith("usnews.com") and "?" not in base_url:
         return f"{base_url}&_page={page_index}"
     separator = "&" if "?" in base_url else "?"
     return f"{base_url}{separator}_page={page_index}"
 
 
-# â”€â”€ Main scraper â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-
-_EXTRA_HEADERS = {
-    "Accept": (
-        "text/html,application/xhtml+xml,application/xml;q=0.9,"
-        "image/avif,image/webp,image/apng,*/*;q=0.8,"
-        "application/signed-exchange;v=b3;q=0.7"
-    ),
-    "Accept-Language": "en-US,en;q=0.9",
-    "Cache-Control": "max-age=0",
-    "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
-    "Sec-Ch-Ua-Mobile": "?0",
-    "Sec-Ch-Ua-Platform": '"macOS"',
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
-    "Sec-Fetch-User": "?1",
-    "Upgrade-Insecure-Requests": "1",
-}
-
-
-def scrape_major(browser, major_slug, major_info, debug=False, debug_dir=None, limit=100):
-    print(f"\nâ–¶  {major_info['name']}  ({major_info['url']})")
-
-    # --- Strategy 0: direct API (no browser) ---
-    print("    Trying direct APIâ€¦")
-    direct = _try_direct_api(major_info["url"], limit=limit)
-    if direct and len(direct) >= 3:
-        print(f"    âœ“  Direct API: {len(direct)} entries")
-        direct = _dedupe_rankings(direct, limit)
-        return {
-            "slug": major_slug,
-            "name": major_info["name"],
-            "sourceUrl": major_info["url"],
-            "scrapedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "rankings": direct,
-        }
-
-    # --- Playwright strategies ---
-    context = browser.new_context(
-        user_agent=_BROWSER_UA,
-        viewport={"width": 1440, "height": 900},
-        locale="en-US",
-        timezone_id="America/New_York",
-        extra_http_headers=_EXTRA_HEADERS,
-    )
-    page = context.new_page()
-
-    captured_responses = []
-
-    def on_response(response):
-        if response.status != 200:
-            return
-        ct = response.headers.get("content-type", "")
-        if "json" not in ct:
-            return
-        url = response.url
-        if not any(kw in url for kw in ["ranking", "search", "colleges", "school", "api"]):
-            return
-        try:
-            body = response.json()
-            captured_responses.append({"url": url, "data": body})
-        except Exception:
-            pass
-
-    page.on("response", on_response)
+def try_browser_html(source_url, limit, debug_path=None):
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        print("Playwright is not installed; skipping browser fallback.")
+        return []
 
     rankings = []
-    try:
-        print("    Loading pageâ€¦")
-        try:
-            page.goto(major_info["url"], wait_until="domcontentloaded", timeout=30000)
-        except Exception as e1:
-            print(f"    domcontentloaded failed ({type(e1).__name__}), continuing anywayâ€¦")
-
-        page.wait_for_timeout(3000)
-
-        print("    Trying JSON-LDâ€¦")
-        rankings = extract_from_jsonld(page) or []
-
-        print("    Trying __NEXT_DATA__â€¦")
-        if len(rankings) < 3:
-            rankings = extract_from_next_data(page) or []
-
-        if len(rankings) < 3:
-            print("    Trying intercepted API responsesâ€¦")
-            rankings = extract_from_api_intercept(captured_responses) or []
-
-        if len(rankings) < 3:
-            print("    Trying DOM extractionâ€¦")
-            rankings = extract_from_dom(page) or []
-
-        if len(rankings) < 3:
-            print("    Trying profile-link extractionâ€¦")
-            rankings = extract_profile_links_from_html(page.content(), start_rank=1, limit=limit)
-
-        while 0 < len(rankings) < limit:
-            next_page = len(rankings) // 10
-            if next_page <= 0:
-                next_page = 1
-            next_url = _page_url(major_info["url"], next_page)
-            before = len(rankings)
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(
+            headless=True,
+            args=["--disable-http2", "--no-sandbox", "--disable-dev-shm-usage"],
+        )
+        context = browser.new_context(
+            user_agent=BROWSER_UA,
+            viewport={"width": 1440, "height": 900},
+            locale="en-US",
+            timezone_id="America/New_York",
+            extra_http_headers={
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+            },
+        )
+        page = context.new_page()
+        page_index = 0
+        while len(rankings) < limit:
+            current_url = build_page_url(source_url, page_index)
             try:
-                page.goto(next_url, wait_until="domcontentloaded", timeout=30000)
-                page.wait_for_timeout(1500)
-                more = extract_profile_links_from_html(page.content(), start_rank=before + 1, limit=limit - before)
-                rankings.extend(more)
-                rankings = _dedupe_rankings(rankings, limit)
-            except Exception as e:
-                print(f"    Pagination stopped at page {next_page}: {type(e).__name__}")
+                page.goto(current_url, wait_until="domcontentloaded", timeout=45000)
+                page.wait_for_timeout(2000)
+            except Exception as exc:
+                print(f"    Pagination stopped at page {page_index}: {type(exc).__name__}")
                 break
+            html = page.content()
+            if debug_path and page_index == 0:
+                debug_path.parent.mkdir(parents=True, exist_ok=True)
+                debug_path.write_text(html, encoding="utf-8")
+            before = len(rankings)
+            rankings.extend(
+                extract_profile_links_from_html(
+                    html,
+                    start_rank=before + 1,
+                    limit=limit - before,
+                )
+            )
+            rankings = dedupe_rankings(rankings, limit)
             if len(rankings) <= before:
                 break
-
-        if debug and debug_dir:
-            html_path = Path(debug_dir) / f"{major_slug}.html"
-            html_path.write_text(page.content(), encoding="utf-8")
-            print(f"    Debug HTML â†’ {html_path}")
-
-    except Exception as e:
-        print(f"    ERROR: {e}")
-    finally:
+            page_index += 1
         context.close()
-
-    rankings = _dedupe_rankings(rankings, limit)
-
-    if rankings:
-        print(f"    âœ“  Found {len(rankings)} schools  (top: {rankings[0]['name']})")
-    else:
-        print("    âœ—  No rankings extracted â€” run with --debug to inspect the HTML")
-
-    return {
-        "slug": major_slug,
-        "name": major_info["name"],
-        "sourceUrl": major_info["url"],
-        "scrapedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "rankings": rankings,
-    }
+        browser.close()
+    return rankings
 
 
-def scrape_major_direct_only(major_slug, major_info, limit=100):
-    """Try only the requests-based endpoint path; useful when Playwright is not installed."""
-    print(f"\n>  {major_info['name']}  ({major_info['url']})")
-    print("    Trying direct API...")
-    direct = _try_direct_api(major_info["url"], limit=limit) or []
-    direct = _dedupe_rankings(direct, limit)
-    if direct:
-        print(f"    OK  Direct API: {len(direct)} entries")
-    else:
-        print("    No ranking entries from direct API")
-    return {
-        "slug": major_slug,
-        "name": major_info["name"],
-        "sourceUrl": major_info["url"],
-        "scrapedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "rankings": direct,
-    }
+def import_csv(csv_path, slug, info, limit, source_url=None):
+    rows = []
+    with Path(csv_path).open(newline="", encoding="utf-8-sig") as handle:
+        reader = csv.DictReader(handle)
+        required = {"rank", "name"}
+        missing = required - set(reader.fieldnames or [])
+        if missing:
+            raise ValueError(f"CSV missing required columns: {', '.join(sorted(missing))}")
+        for row in reader:
+            rank = normalize_rank(row.get("rank"))
+            name = (row.get("name") or "").strip()
+            if not rank or not name:
+                continue
+            rows.append({
+                "rank": rank,
+                "name": name,
+                "unitId": (row.get("unitId") or "").strip() or None,
+            })
+    return ranking_payload(slug, info, dedupe_rankings(rows, limit), source_url)
+
+
+def write_outputs(output, out_path, sync_targets):
+    out_path.write_text(json.dumps(output, indent=2, ensure_ascii=False), encoding="utf-8")
+    if not sync_targets:
+        return
+    repo_root = Path(__file__).resolve().parents[1]
+    targets = [
+        repo_root / "frontend" / "src" / "data" / "rankings.json",
+        repo_root / "backend" / "src" / "main" / "resources" / "rankings.json",
+    ]
+    for target in targets:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(out_path, target)
+        print(f"    synced -> {target.relative_to(repo_root)}")
+
+
+def resolve_targets(major):
+    if not major:
+        return MAJORS
+    slug = ALIASES.get(major, major)
+    if slug not in MAJORS:
+        available = ", ".join(sorted(list(ALIASES) + list(MAJORS)))
+        raise ValueError(f"Unknown major '{major}'. Available: {available}")
+    return {slug: MAJORS[slug]}
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Scrape US News college rankings")
-    parser.add_argument("--major", help="Major slug or alias (e.g. cs, ee, business)")
+    parser = argparse.ArgumentParser(description="Collect college ranking data")
+    parser.add_argument("--major", help="Major/ranking slug or alias, e.g. nat or national-universities")
     parser.add_argument("--limit", type=int, default=100, help="Max schools per ranking list")
     parser.add_argument("--csv", help="Import rankings from CSV instead of scraping. Required columns: rank,name")
-    parser.add_argument("--sync", action="store_true", help="Copy output to frontend/src/data and backend resources")
     parser.add_argument("--source-url", help="Source URL to store when importing CSV")
-    parser.add_argument("--debug", action="store_true", help="Save HTML files for selector debugging")
-    parser.add_argument("--out", default=None, help="Output JSON path (default: output/rankings.json)")
-    parser.add_argument("--dry-run", action="store_true", help="Print URLs without launching browser")
-    parser.add_argument("--headed", action="store_true", help="Run Chromium in headed (visible) mode")
+    parser.add_argument("--sync", action="store_true", help="Copy output to frontend and backend data locations")
+    parser.add_argument("--debug", action="store_true", help="Save first loaded HTML page for inspection")
+    parser.add_argument("--out", default=None, help="Output JSON path")
+    parser.add_argument("--dry-run", action="store_true", help="Print target URLs and exit")
     args = parser.parse_args()
 
     limit = max(1, min(args.limit, 250))
-
-    if args.major:
-        slug = ALIASES.get(args.major, args.major)
-        if slug not in MAJORS:
-            print(f"Unknown major '{args.major}'. Available: {', '.join(list(ALIASES) + list(MAJORS))}")
-            sys.exit(1)
-        targets = {slug: MAJORS[slug]}
-    else:
-        targets = MAJORS
-
-    if args.dry_run:
-        print("Dry run â€” URLs to scrape:")
-        for slug, info in targets.items():
-            print(f"  {slug}: {info['url']}")
-        return
-
+    targets = resolve_targets(args.major)
     out_path = Path(args.out) if args.out else Path(__file__).parent / "output" / "rankings.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    debug_dir = out_path.parent / "debug_html" if args.debug else None
-    if debug_dir:
-        debug_dir.mkdir(exist_ok=True)
+
+    if args.dry_run:
+        for slug, info in targets.items():
+            print(f"{slug}: {info['url']}")
+        return
 
     existing = {}
     if out_path.exists():
         try:
             for entry in json.loads(out_path.read_text(encoding="utf-8")):
                 existing[entry["slug"]] = entry
-        except Exception:
+        except (OSError, ValueError, KeyError):
             pass
 
     if args.csv:
         if len(targets) != 1:
-            print("CSV import needs --major so the imported list has a slug/name.")
+            print("CSV import requires --major so the rows have one slug/name.")
             sys.exit(1)
         slug, info = next(iter(targets.items()))
-        imported = load_rankings_csv(
-            args.csv,
-            major_slug=slug,
-            major_name=info["name"],
-            source_url=args.source_url or info["url"],
-            limit=limit,
-        )
-        existing[slug] = imported
-        output = list(existing.values())
-        _write_outputs(output, out_path, sync_targets=args.sync)
-        print(f"\nSaved CSV import: {len(imported['rankings'])} entries -> {out_path}")
-        return
-
-    try:
-        from playwright.sync_api import sync_playwright
-    except ImportError:
-        print("Playwright is not installed. Trying direct API only.")
-        print("Install browser fallback with: pip install -r requirements.txt && playwright install chromium")
+        existing[slug] = import_csv(args.csv, slug, info, limit, args.source_url or info["url"])
+    else:
         for slug, info in targets.items():
-            result = scrape_major_direct_only(slug, info, limit=limit)
-            if result["rankings"]:
-                existing[slug] = result
-
-        output = list(existing.values())
-        _write_outputs(output, out_path, sync_targets=args.sync)
-        total = sum(len(m["rankings"]) for m in output)
-        print(f"\nSaved {len(output)} majors, {total} total entries -> {out_path}")
-        return
-
-    with sync_playwright() as pw:
-        browser = pw.chromium.launch(
-            headless=not args.headed,
-            args=[
-                "--disable-http2",
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-            ],
-        )
-        for slug, info in targets.items():
-            result = scrape_major(browser, slug, info, debug=args.debug, debug_dir=debug_dir, limit=limit)
-            if result["rankings"]:
-                existing[slug] = result
-            time.sleep(2)
-        browser.close()
+            print(f"\n> {info['name']} ({info['url']})")
+            print("    Trying direct API...")
+            rankings = try_direct_api(info["url"], limit)
+            if not rankings:
+                print("    Trying browser HTML...")
+                debug_path = None
+                if args.debug:
+                    debug_path = out_path.parent / "debug_html" / f"{slug}.html"
+                rankings = try_browser_html(info["url"], limit, debug_path)
+            if rankings:
+                print(f"    Found {len(rankings)} schools; first: {rankings[0]['name']}")
+                existing[slug] = ranking_payload(slug, info, rankings)
+            else:
+                print("    No rankings found.")
+            time.sleep(1)
 
     output = list(existing.values())
-    _write_outputs(output, out_path, sync_targets=args.sync)
-    total = sum(len(m["rankings"]) for m in output)
-    print(f"\nâœ…  Saved {len(output)} majors, {total} total entries â†’ {out_path}")
-    if not args.sync:
-        print(f"\nNext step:")
-        print(f"  python scrape_rankings.py --sync")
+    write_outputs(output, out_path, args.sync)
+    total = sum(len(entry.get("rankings", [])) for entry in output)
+    print(f"\nSaved {len(output)} ranking lists, {total} total entries -> {out_path}")
 
 
 if __name__ == "__main__":
