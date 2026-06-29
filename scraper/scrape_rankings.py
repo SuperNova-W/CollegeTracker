@@ -1,6 +1,3 @@
-Exit code: 0
-Wall time: 0.2 seconds
-Output:
 #!/usr/bin/env python3
 """
 College ranking ingestion for CollegeTracker.
