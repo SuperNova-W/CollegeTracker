@@ -1,3 +1,6 @@
+Exit code: 0
+Wall time: 0.2 seconds
+Output:
 # College ranking data
 
 This app can read ranking data from `rankings.json` in two places:
@@ -14,12 +17,15 @@ to both app targets.
 cd scraper
 pip install -r requirements.txt
 playwright install chromium
-python scrape_rankings.py --major national-universities --limit 100 --sync
+python scrape_rankings.py --major computer-science --sync
 ```
 
 US News may time out, paywall, block automation, or change its page/API shape.
 The script only uses normal requests/browser loading. If that does not return
 data, use the CSV import path below.
+
+By default the scraper keeps paginating until US News stops returning new public
+entries. Add `--limit 100` when you intentionally want to cap a run.
 
 ## Import from CSV
 
@@ -41,10 +47,9 @@ Then run:
 
 ```bash
 cd scraper
-python scrape_rankings.py --major national-universities --csv input/us-news-national-universities.csv --limit 100 --sync
+python scrape_rankings.py --major national-universities --csv input/us-news-national-universities.csv --sync
 ```
 
 That produces the JSON shape consumed by both the React frontend and Spring
 backend.
-
 
