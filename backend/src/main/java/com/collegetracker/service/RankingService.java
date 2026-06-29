@@ -30,7 +30,7 @@ public class RankingService {
         ClassPathResource resource = new ClassPathResource("rankings.json");
         if (!resource.exists()) {
             log.info("rankings.json not found in classpath — skipping ranking load. " +
-                     "Run the scraper and copy output/rankings.json to backend/src/main/resources/");
+                     "Run the scraper with --sync to copy data into backend resources.");
             return;
         }
 
@@ -77,7 +77,7 @@ public class RankingService {
         }
     }
 
-    /** Returns ranked list (1–50) for a given major slug. */
+    /** Returns ranked list for a given major slug. */
     public List<MajorRanking> getRankingsForMajor(String majorSlug) {
         return rankingRepository.findByMajorSlugOrderByRankAsc(majorSlug);
     }
@@ -94,3 +94,4 @@ public class RankingService {
             .collect(Collectors.toList());
     }
 }
+
